@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# pytest
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Experiment outputs (large JSON files)
+experiments/results/*.json
+cm_dgm/results/*.jsonl
+cm_dgm/results/*.txt
+
+# Temp
+*.tmp

@@ -1,0 +1,27 @@
+# Causal Mirror — 本地 Ollama 实验配置（快速迭代用）
+
+experiment:
+  name: "causal-mirror-ollama"
+  rounds: 3
+  tasks_per_round: 20
+  groups: ["A", "B", "C"]  # A=自建模, B=通用反馈, C=裸Agent
+
+llm:
+  provider: "openai"  # Ollama 兼容 OpenAI API
+  model: "lfm2.5-thinking:latest"
+  api_key_env: "OLLAMA_API_KEY"  # Ollama 不需要真实key，随便设
+  base_url: "http://localhost:11434/v1"
+  temperature: 0.3
+  max_tokens: 4096  # 思考模型需要更多token，thinking + answer都要空间
+
+cssr:
+  L_max: null  # auto-estimate
+  alpha: 0.05
+  test: "chi2"
+  correction: "bonferroni"
+  min_count: 2
+
+output:
+  results_dir: "experiments/results"
+  save_traces: true
+  save_reports: true

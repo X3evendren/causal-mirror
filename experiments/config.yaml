@@ -1,0 +1,43 @@
+# Causal Mirror — 实验配置
+
+experiment:
+  name: "causal-mirror-v1"
+  rounds: 5
+  tasks_per_round: 20
+  groups: ["A", "B", "C"]  # A=自建模, B=通用反馈, C=裸Agent
+
+llm:
+  provider: "modelscope"  # openai | modelscope | anthropic
+  model: "Qwen/Qwen3.5-27B"  # V3.2配额有限，Qwen3.5-27B免费可用
+  api_key_env: "MODELSCOPE_API_KEY"
+  base_url: "https://api-inference.modelscope.cn/v1"  # 魔搭 API-Inference 端点
+  temperature: 0.3
+  max_tokens: 2048
+
+cssr:
+  L_max: null  # auto-estimate
+  alpha: 0.05
+  test: "chi2"
+  correction: "bonferroni"
+  min_count: 3
+
+behavior_encoding:
+  action_types:
+    - "INFER"      # 推理/推导
+    - "CALC"       # 计算/算术
+    - "VERIFY"     # 验证/检查
+    - "CORRECT"    # 自我修正
+  quality_types:
+    - "CORRECT"    # 步骤正确
+    - "PARTIAL"    # 部分正确
+    - "INCORRECT"  # 步骤错误
+    - "SKIPPED"    # 跳过/缺失
+
+tasks:
+  source: "gsm8k_sample"  # 采样自GSM8K
+  # 如果没有GSM8K数据，使用内置示例题
+
+output:
+  results_dir: "experiments/results"
+  save_traces: true
+  save_reports: true
