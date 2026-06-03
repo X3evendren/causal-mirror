@@ -1,0 +1,28 @@
+# Causal Mirror — 研究生难度基准测试配置
+# 使用 ModelScope 魔搭免费 DeepSeek API
+
+experiment:
+  name: "causal-mirror-benchmark"
+  rounds: 4
+  groups: ["A", "B", "C"]
+  # A = Full管线 (CSSR + 风险模型 + 策略干预)
+  # B = 仅观察 (CSSR + 度量报告, 无干预)
+  # C = 裸Agent (无任何增强)
+
+llm:
+  provider: "modelscope"
+  model: "deepseek-ai/DeepSeek-V4-Flash"
+  api_key_env: "MODELSCOPE_API_KEY"
+  base_url: "https://api-inference.modelscope.cn/v1"
+  temperature: 0.1  # 低温度提高一致性和数学准确性
+  max_tokens: 4096   # 充足空间给逐步推理
+
+cssr:
+  L_max: null
+  alpha: 0.05
+  test: "chi2"
+  correction: "bonferroni"
+  min_count: 2       # 30题数据量较小，降低最小出现次数
+
+output:
+  results_dir: "experiments/results"
