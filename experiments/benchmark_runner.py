@@ -27,28 +27,6 @@ from agent.behavior_encoder import BehaviorEncoder
 from agent.prompts import SYSTEM_PROMPT_BASE
 
 
-# ── Prompt templates ─────────────────────────────────────────
-
-SYSTEM_PROMPT_GROUP_A = SYSTEM_PROMPT_BASE + """
-
-## 自我认知反馈（基于前一轮行为分析）
-
-{self_report}
-
-## 策略建议
-{strategy}
-
-请在做题时特别注意上述反馈。"""
-
-SYSTEM_PROMPT_GROUP_B = SYSTEM_PROMPT_BASE + """
-
-## 行为度量报告
-
-{metrics_report}
-
-请继续努力，保持高质量的解题过程。"""
-
-
 # ── Data classes ─────────────────────────────────────────────
 
 @dataclass
@@ -110,27 +88,57 @@ class BenchmarkRunner:
         self.max_tokens = config.get("max_tokens", 4096)
         self.encoder = BehaviorEncoder()
 
-    def solve(self, problem: dict, system_prompt: str) -> ProblemResult:
-        """Solve one problem using the LLM."""
+    def solve(self, problem: dict, system_prompt: str,
+              intervention_text: str = "") -> ProblemResult:
+        """Solve one problem using the LLM (with retry on quota/rate errors).
+
+        Args:
+            intervention_text: If non-empty, appended to the USER message
+                               (NEVER the system prompt) as a minimal reminder.
+        """
+        user_content = problem["problem"]
+        if intervention_text:
+            user_content = user_content + "\n\n" + intervention_text
+
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": problem["problem"]},
+            {"role": "user", "content": user_content},
         ]
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-            )
-            full = response.choices[0].message.content or ""
-        except Exception as e:
+        full = None
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
+                full = response.choices[0].message.content or ""
+                break
+            except Exception as e:
+                msg = str(e)
+                is_retryable = any(kw in msg.lower() for kw in
+                                   ("quota", "rate", "limit", "timeout", "connection"))
+                if is_retryable and attempt < max_retries - 1:
+                    wait = (attempt + 1) * 5
+                    time.sleep(wait)
+                    continue
+                return ProblemResult(
+                    problem_idx=-1, domain=problem.get("domain", ""),
+                    difficulty=problem.get("difficulty", ""),
+                    predicted=None, is_correct=False,
+                    steps_text=f"API ERROR: {e}", full_response=f"ERROR: {e}",
+                )
+
+        if full is None:
             return ProblemResult(
                 problem_idx=-1, domain=problem.get("domain", ""),
                 difficulty=problem.get("difficulty", ""),
                 predicted=None, is_correct=False,
-                steps_text=f"API ERROR: {e}", full_response=f"ERROR: {e}",
+                steps_text="ERROR: max retries exceeded",
+                full_response="ERROR: max retries exceeded",
             )
 
         # Extract steps
@@ -157,14 +165,26 @@ class BenchmarkRunner:
         )
 
     def solve_batch(
-        self, problems: list[dict], system_prompt: str, verbose: bool = False,
+        self, problems: list[dict], system_prompt: str,
+        intervention_map: dict[int, str] | None = None,
+        verbose: bool = False,
     ) -> list[ProblemResult]:
-        """Solve a batch of problems."""
+        """Solve a batch of problems with optional per-problem interventions.
+
+        Args:
+            intervention_map: Dict mapping problem index -> intervention text.
+                              Only problems in the map get interventions.
+        """
         results = []
         for i, prob in enumerate(problems):
             if verbose:
                 print(f"    [{i+1}/{len(problems)}] {prob['domain']} ", end="", flush=True)
-            result = self.solve(prob, system_prompt)
+
+            interv = ""
+            if intervention_map and i in intervention_map:
+                interv = intervention_map[i]
+
+            result = self.solve(prob, system_prompt, interv)
             result.problem_idx = i
             results.append(result)
             if verbose:
@@ -400,73 +420,40 @@ class ExperimentHarness:
     def _run_observe(
         self, problems: list[dict], rounds: int, offline: bool,
     ) -> list[RoundResult]:
-        """Group B: CSSR analysis, metrics-only report, no intervention."""
-        history = []
-        inject_text = ""
-        cssr_config = CSSRConfig(
-            L_max=self.cssr_cfg_dict.get("L_max"),
-            alpha=self.cssr_cfg_dict.get("alpha", 0.05),
-            test=self.cssr_cfg_dict.get("test", "chi2"),
-            correction=self.cssr_cfg_dict.get("correction", "bonferroni"),
-            min_count=self.cssr_cfg_dict.get("min_count", 2),
+        """Group B: CSSR analysis, self-report saved to disk, NO intervention."""
+        return self._run_with_intervention(
+            problems, rounds, offline, group_label="B", inject_interventions=False,
         )
-        if offline:
-            sim = OfflineSimulator(seed=1)
-
-        for r in range(rounds):
-            print(f"  Round {r+1}/{rounds}: ", end="", flush=True)
-
-            # Solve
-            sys_prompt = SYSTEM_PROMPT_BASE
-            if inject_text:
-                sys_prompt = SYSTEM_PROMPT_GROUP_B.format(metrics_report=inject_text)
-
-            if offline:
-                results = sim.simulate_batch(problems)
-            else:
-                client = make_client(self.llm_cfg)
-                runner = BenchmarkRunner(client, self.llm_cfg)
-                results = runner.solve_batch(problems, sys_prompt)
-
-            correct = sum(1 for r in results if r.is_correct)
-            acc = correct / len(results) if results else 0
-
-            # CSSR analysis
-            cssr_metrics = None
-            if len(results) >= 3:
-                all_syms = []
-                for res in results:
-                    all_syms.extend(res.symbols)
-                if len(all_syms) >= 10:
-                    try:
-                        cssr = CSSR(cssr_config)
-                        cssr.fit(all_syms)
-                        cssr_metrics = dict(cssr.metrics)
-                        inject_text = self._metrics_only_report(cssr_metrics)
-                    except Exception:
-                        pass
-
-            print(f"准确率={acc:.1%} ({correct}/{len(results)}) ", end="")
-            if cssr_metrics:
-                print(f"C_mu={cssr_metrics['statistical_complexity']:.3f}")
-            else:
-                print()
-
-            history.append(RoundResult(
-                round_num=r, accuracy=acc,
-                n_correct=correct, n_total=len(results),
-                cssr_metrics=cssr_metrics,
-                results=results,
-            ))
-        return history
 
     def _run_full(
         self, problems: list[dict], rounds: int, offline: bool,
     ) -> list[RoundResult]:
-        """Group A: Full pipeline — CSSR + risk model + strategy intervention."""
-        history = []
-        inject_text = ""
-        all_traces_so_far: list[str] = []
+        """Group A: Full pipeline — CSSR analysis + targeted intervention."""
+        return self._run_with_intervention(
+            problems, rounds, offline, group_label="A", inject_interventions=True,
+        )
+
+    def _run_with_intervention(
+        self, problems: list[dict], rounds: int, offline: bool,
+        group_label: str, inject_interventions: bool,
+    ) -> list[RoundResult]:
+        """Shared experiment loop for groups A and B.
+
+        Both groups get CSSR analysis and saved self-reports.
+        Only group A gets per-problem targeted interventions injected.
+        System prompt NEVER changes.
+        """
+        from experiments.intervention import (
+            TargetedIntervention, generate_self_report,
+        )
+
+        history: list[RoundResult] = []
+        all_traces: list[str] = []
+        domain_acc: dict[str, float] = {}
+        cssr_machine = None
+        cssr_metrics = None
+        intervention_gen = TargetedIntervention()
+
         cssr_config = CSSRConfig(
             L_max=self.cssr_cfg_dict.get("L_max"),
             alpha=self.cssr_cfg_dict.get("alpha", 0.05),
@@ -475,41 +462,44 @@ class ExperimentHarness:
             min_count=self.cssr_cfg_dict.get("min_count", 2),
         )
         if offline:
-            sim = OfflineSimulator(seed=2)
+            sim = OfflineSimulator(seed=1 if group_label == "B" else 2)
 
         for r in range(rounds):
             print(f"  Round {r+1}/{rounds}: ", end="", flush=True)
 
-            # Build strategy from prior analysis
-            strategy_text = self._build_strategy(history)
-            sys_prompt = SYSTEM_PROMPT_BASE
-            if inject_text:
-                sys_prompt = SYSTEM_PROMPT_GROUP_A.format(
-                    self_report=inject_text,
-                    strategy=strategy_text or "运用所学解题策略，注意验证每一步。",
-                )
+            # Build per-problem intervention map (Group A only)
+            intervention_map: dict[int, str] = {}
+            if inject_interventions and cssr_metrics is not None:
+                for i, prob in enumerate(problems):
+                    text = intervention_gen.generate(
+                        cssr_metrics, cssr_machine, domain_acc, prob,
+                    )
+                    if text:
+                        intervention_map[i] = text
 
-            # Solve
+            # Solve — ALWAYS use the original system prompt
             if offline:
                 results = sim.simulate_batch(problems)
             else:
                 client = make_client(self.llm_cfg)
                 runner = BenchmarkRunner(client, self.llm_cfg)
-                results = runner.solve_batch(problems, sys_prompt)
+                results = runner.solve_batch(
+                    problems, SYSTEM_PROMPT_BASE, intervention_map,
+                )
 
             correct = sum(1 for r in results if r.is_correct)
             acc = correct / len(results) if results else 0
+            domain_acc = self._domain_accuracy(results)
 
-            # Accumulate traces
+            # Accumulate traces for CSSR
             for res in results:
-                all_traces_so_far.append(res.steps_text)
+                all_traces.append(res.steps_text)
 
             # CSSR analysis
-            cssr_metrics = None
-            if all_traces_so_far:
+            if all_traces:
                 encoder = BehaviorEncoder()
                 all_syms = []
-                for trace in all_traces_so_far[-200:]:  # recent traces
+                for trace in all_traces[-200:]:
                     syms = encoder.encode(trace)
                     all_syms.extend(syms)
                 if len(all_syms) >= 10:
@@ -517,14 +507,29 @@ class ExperimentHarness:
                         cssr = CSSR(cssr_config)
                         cssr.fit(all_syms)
                         cssr_metrics = dict(cssr.metrics)
-                        inject_text = self._generate_self_report(
-                            cssr.metrics, cssr.machine, history, results,
-                        )
+                        cssr_machine = cssr.machine
+
+                        # Save full self-report to disk (NOT injected into prompt)
+                        try:
+                            report_text = generate_self_report(
+                                cssr, cssr_machine, domain_acc, r,
+                            )
+                            os.makedirs(self.output_dir, exist_ok=True)
+                            path = os.path.join(
+                                self.output_dir,
+                                f"report_{group_label}_round{r}.md",
+                            )
+                            with open(path, "w", encoding="utf-8") as f:
+                                f.write(report_text)
+                        except Exception:
+                            pass
                     except Exception:
                         pass
 
-            domain_acc = self._domain_accuracy(results)
+            n_interv = len(intervention_map)
             print(f"准确率={acc:.1%} ({correct}/{len(results)}) ", end="")
+            if inject_interventions and n_interv > 0:
+                print(f"干预×{n_interv} ", end="")
             if cssr_metrics:
                 print(f"C_mu={cssr_metrics['statistical_complexity']:.3f} "
                       f"states={cssr_metrics['n_states']}")
@@ -536,96 +541,9 @@ class ExperimentHarness:
                 n_correct=correct, n_total=len(results),
                 domain_accuracy=domain_acc,
                 cssr_metrics=cssr_metrics,
-                self_report=inject_text,
                 results=results,
             ))
         return history
-
-    # ── Helpers ──────────────────────────────────────────────
-
-    def _build_strategy(self, history: list[RoundResult]) -> str:
-        """Build strategic recommendations from CSSR analysis."""
-        if not history:
-            return ""
-
-        last = history[-1]
-        if last.cssr_metrics is None:
-            return "仔细推理每一步，不要跳过验证。"
-
-        m = last.cssr_metrics
-        strategies = []
-
-        if m["statistical_complexity"] < 0.2:
-            strategies.append("策略单一，尝试多样化推理路径")
-        elif m["statistical_complexity"] > 1.5:
-            strategies.append("行为复杂但可能碎片化，保持策略一致性")
-
-        if m["entropy_rate"] > 1.5:
-            strategies.append("每步不确定性高，增加中间验证")
-        else:
-            strategies.append("推理稳定，继续保持")
-
-        # Analyze error states
-        for result in last.results:
-            if not result.is_correct:
-                strategies.append(
-                    f"在 {result.domain} 类问题上需要更仔细的验证步骤"
-                )
-                break
-
-        return "\n".join(f"- {s}" for s in strategies[:4])
-
-    def _generate_self_report(self, machine, metrics, history, recent):
-        """Generate natural-language self-report from CSSR analysis."""
-        n_correct = sum(1 for r in recent if r.is_correct)
-        n_total = len(recent)
-
-        report = (
-            f"## 行为度量 (Round {len(history)+1})\n\n"
-            f"- 统计复杂度 C_μ: {metrics.statistical_complexity():.4f} bits\n"
-            f"- 熵率 h_μ: {metrics.entropy_rate():.4f} bits\n"
-            f"- 超熵 E: {metrics.excess_entropy():.4f} bits\n"
-            f"- 因果状态数: {len(machine.states)}\n"
-            f"- 预测信息 χ: {metrics.predictive_information():.4f} bits\n\n"
-            f"## 本轮表现\n\n"
-            f"- 准确率: {n_correct}/{n_total} = {n_correct/n_total:.1%}\n"
-        )
-
-        # Error state analysis
-        error_states = []
-        for s in machine.states:
-            error_prob = 0.0
-            for sym, prob in s.emission_probs.items():
-                if "_INCORRECT" in str(sym) or "_PARTIAL" in str(sym):
-                    error_prob += prob
-            if error_prob > 0.4:
-                error_states.append(f"状态{s.state_id}中错误率高达{error_prob:.1%}")
-
-        if error_states:
-            report += "\n⚠️ 高风险状态:\n"
-            for es in error_states:
-                report += f"- {es}\n"
-
-        # Strategy
-        report += "\n## 改进建议\n\n"
-        if metrics.statistical_complexity() < 0.3:
-            report += "- 行为模式过于简单，尝试更严谨的验证策略\n"
-        if n_correct / n_total < 0.6:
-            report += "- 准确率偏低，在计算步骤后增加验证环节\n"
-        if metrics.entropy_rate() > 1.5:
-            report += "- 每步推理的不确定性高，放慢速度仔细检查\n"
-        report += "- 在得出结论前，至少用一种替代方法验证\n"
-
-        return report
-
-    def _metrics_only_report(self, metrics: dict) -> str:
-        """Generate a metrics-only report (Group B)."""
-        return (
-            f"C_μ={metrics['statistical_complexity']:.4f}, "
-            f"h_μ={metrics['entropy_rate']:.4f}, "
-            f"E={metrics['excess_entropy']:.4f}, "
-            f"n_states={metrics['n_states']}"
-        )
 
     def _domain_accuracy(self, results: list[ProblemResult]) -> dict[str, float]:
         by_domain: dict[str, list[float]] = defaultdict(list)
